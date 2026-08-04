@@ -1,0 +1,2 @@
+# Put .wav / .mp3 / .ogg audio files here for testing.
+# The script accepts any sample rate and channel count (resamples to 16 kHz mono).

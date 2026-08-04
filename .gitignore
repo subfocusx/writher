@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.kiro/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime-generated files
+writher.db
+writher.log
+writher.log.*
+writher.ico
+writher_icon.png
+recovery_notes.txt
+
+# Development backups and legacy asset scripts
+assets/
+
+# Landing page (hosted separately)
+site/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# SEO instructions (local only)
+modificaseo.md
+
+# Internal planning docs
+obsidian-integration.md
+
+# Локальные окружения и артефакты (не в git)
+venv_v2/
+build_venv/
+uv_build_venv/
+.backups/
+*.bak
+*.bak.*
+.coverage
+.pytest_cache/
+
+# Мусор от битых pip-установок / тестовых запусков
+Q
+=*
+~/
+chunk_test.txt
+dur_test.txt
+length_test.txt
+padding_test.txt
+repeat_test.txt
+test_result.txt
+entries.txt
+
+# Внутренние аналитические заметки (не часть продукта)
+analysis.txt
+analysis_report.md
+analysis_v2.md
+memory_analysis.md
+stability_audit.md
+
+# Тестовые аудиозаписи (личные, не в git)
+scripts/test_audio/*.mp3
+
+# ASR model files (large / downloaded on demand, NOT published)
+# The default GigaAM v3 model is fetched automatically from Hugging Face
+# (istupakov/gigaam-v3-onnx) on first run — see README.
+models/
+
+# Repo-internal docs that are not part of the published package
+docs/
+roadmap/

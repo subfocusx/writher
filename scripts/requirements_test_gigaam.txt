@@ -1,0 +1,5 @@
+# Dependencies for scripts/test_gigaam.py
+# Install with: pip install -r requirements_test_gigaam.txt
+
+onnx-asr
+soundfile

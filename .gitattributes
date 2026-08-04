@@ -1,0 +1,5 @@
+# Commit as UTF-8, normalise line endings on all platforms.
+* text=auto
+
+# Markdown
+*.md text eol=lf

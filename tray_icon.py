@@ -1,0 +1,59 @@
+"""System tray icon for Writher with Pandora Blackboard eyes."""
+
+import locales
+from brand import make_tray_icon
+
+
+class TrayIcon:
+    def __init__(self, on_quit, on_show_settings=None):
+        self._on_quit = on_quit
+        self._on_show_settings = on_show_settings
+        self._icon = None
+
+    def _build_menu(self):
+        import pystray
+        items = [
+            pystray.MenuItem("Writher", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+        ]
+        if self._on_show_settings:
+            items.append(pystray.MenuItem(locales.get("tray_settings"),
+                                          self._show_settings))
+            items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(locales.get("tray_quit"), self._quit))
+        return pystray.Menu(*items)
+
+    def _show_settings(self, icon, item):
+        if self._on_show_settings:
+            self._on_show_settings()
+
+    def _quit(self, icon, item):
+        icon.stop()
+        self._on_quit()
+
+    def start(self):
+        import pystray
+        img = make_tray_icon(recording=False)
+        self._icon = pystray.Icon(
+            "Writher",
+            img,
+            locales.get("tray_idle"),
+            menu=self._build_menu(),
+        )
+        self._icon.run_detached()
+
+    def set_recording(self, recording: bool):
+        if self._icon is None:
+            return
+        self._icon.icon = make_tray_icon(recording=recording)
+        self._icon.title = (locales.get("tray_recording") if recording
+                            else locales.get("tray_idle"))
+
+    def set_tooltip(self, text: str):
+        """Update the tray icon tooltip text (used for status warnings)."""
+        if self._icon is not None:
+            self._icon.title = text
+
+    def stop(self):
+        if self._icon is not None:
+            self._icon.stop()
