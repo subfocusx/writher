@@ -53,6 +53,35 @@ class TestClipboardOperations:
         _open_clipboard()  # should not raise
 
 
+class TestClearClipboard:
+    """Tests for _clear_clipboard() — fallback, called only when clipboard
+    restore fails. It empties the buffer so a stray manual Ctrl+V in
+    another window won't re-paste the dictated text."""
+
+    def test_clear_clipboard_empties_text(self):
+        """After _set_clipboard_text('x') + _clear_clipboard(), clipboard is empty."""
+        from injector import _set_clipboard_text, _clear_clipboard, _get_clipboard_text
+        _set_clipboard_text("hello world")
+        assert _get_clipboard_text() == "hello world"
+        result = _clear_clipboard()
+        assert result is True
+        assert _get_clipboard_text() == ""
+
+    def test_clear_clipboard_returns_bool(self):
+        """_clear_clipboard returns a bool."""
+        from injector import _clear_clipboard
+        result = _clear_clipboard()
+        assert isinstance(result, bool)
+
+    def test_clear_clipboard_idempotent(self):
+        """Clearing an already-empty clipboard is fine."""
+        from injector import _clear_clipboard
+        _clear_clipboard()
+        # second call should still succeed (empty stays empty)
+        result = _clear_clipboard()
+        assert result is True
+
+
 class TestCtrlV:
     """Tests for _send_ctrl_v()."""
 
@@ -113,3 +142,122 @@ class TestConstants:
         from injector import _RETRY_DELAY
         assert isinstance(_RETRY_DELAY, (int, float))
         assert _RETRY_DELAY > 0
+
+
+class TestKeybdEventTiming:
+    """Tests for Ctrl+V keybd_event timing — fast machines need gaps
+    between down/up so the OS doesn't collapse the chord. Without
+    the gaps, the target app sees only Ctrl-down/Ctrl-up and never
+    receives the V (the 'в буфер не попадает' symptom)."""
+
+    def test_keybd_event_calls_have_gaps(self, monkeypatch):
+        """_send_ctrl_v() interleaves sleeps between keybd_event calls."""
+        from injector import _user32
+        events = []
+
+        def fake_keybd(bVk, bScan, flags, extra):
+            events.append((bVk, bScan, flags, extra))
+
+        sleeps = []
+
+        def fake_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr(_user32, "keybd_event", fake_keybd)
+        # Patch time.sleep in the injector module's namespace.
+        import injector
+        monkeypatch.setattr(injector.time, "sleep", fake_sleep)
+
+        injector._send_ctrl_v(None)
+
+        # We expect at least 3 sleeps between the 4 keybd_event calls.
+        assert len(events) == 4, f"expected 4 keybd_event calls, got {len(events)}"
+        # Scan codes for Ctrl and V are sent down then up.
+        # Each call should be the right keystroke; combined flags include
+        # KEYEVENTF_SCANCODE; the V-up and Ctrl-up calls also set KEYUP.
+        for bVk, bScan, flags, _extra in events:
+            assert bVk == 0, "bVk must be 0 when KEYEVENTF_SCANCODE is set"
+            assert flags & 0x0008, "KEYEVENTF_SCANCODE must be set"  # 0x0008
+        # At least 3 sleeps occurred between the 4 events.
+        assert len(sleeps) >= 3, f"expected ≥3 sleeps between 4 events, got {len(sleeps)}"
+        # Each inter-event sleep should be non-trivial (>0).
+        for s in sleeps:
+            assert s > 0, f"sleep between keybd events must be >0, got {s}"
+
+
+class TestInjectPostPasteDelay:
+    """Tests for the post-Ctrl+V sleep before restoring the clipboard.
+    Too short → heavy editors (Word, big contenteditable, Electron)
+    haven't read the clipboard yet → we restore the user's old content
+    and the dictated text's paste silently drops. Recovery file has the
+    text either way, but the user's screen never receives it."""
+
+    def test_inject_sleeps_before_restore(self, monkeypatch):
+        """inject() must sleep ≥ 0.8s between Ctrl+V and clipboard restore."""
+        import injector
+        from injector import _set_clipboard_text, _clear_clipboard, _get_clipboard_text
+
+        # Real clipboard helpers: set the dictation text, empty by default so
+        # original_clipboard is "" → inject() calls _clear_clipboard() at the end.
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        # Make _get_clipboard_text return "" (no original content) so the
+        # inject() path ends with the clear branch.
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "")
+
+        # Track the sleeps that happen inside inject().
+        sleeps = []
+        original_sleep = injector.time.sleep
+
+        def fake_sleep(s):
+            sleeps.append(s)
+            # Do not actually sleep — keep the test fast.
+        monkeypatch.setattr(injector.time, "sleep", fake_sleep)
+
+        injector.inject("hello world", 0x1234)
+
+        # We need at least one sleep ≥ 0.8s after the Ctrl+V simulation
+        # but before the clipboard is cleared/restored.
+        max_sleep = max(sleeps) if sleeps else 0
+        assert max_sleep >= 0.8, (
+            f"inject() must sleep ≥0.8s before touching clipboard again, "
+            f"max observed sleep = {max_sleep}"
+        )
+
+    def test_inject_restores_original_clipboard(self, monkeypatch):
+        """inject() must restore the user's original clipboard content after paste."""
+        import injector
+
+        restored = []
+
+        def fake_set(text):
+            restored.append(text)
+            return True
+
+        def fake_get():
+            return "пользовательский текст"
+
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        monkeypatch.setattr(injector, "_get_clipboard_text", fake_get)
+        monkeypatch.setattr(injector, "_set_clipboard_text", fake_set)
+        monkeypatch.setattr(injector.time, "sleep", lambda s: None)
+
+        injector.inject("диктуемый текст", 0x1234)
+
+        # The original clipboard content must be restored at the end (last set).
+        assert restored[-1] == "пользовательский текст"
+
+    def test_inject_clears_when_no_original(self, monkeypatch):
+        """inject() clears the clipboard when there was no original text."""
+        import injector
+        from injector import _clear_clipboard
+
+        cleared = []
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "")
+        monkeypatch.setattr(injector, "_set_clipboard_text", lambda _t: True)
+        monkeypatch.setattr(injector, "_clear_clipboard", lambda: cleared.append(True) or True)
+        monkeypatch.setattr(injector.time, "sleep", lambda s: None)
+
+        injector.inject("диктуемый текст", 0x1234)
+
+        assert len(cleared) == 1

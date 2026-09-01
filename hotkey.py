@@ -10,7 +10,10 @@ from pynput import keyboard
 import config
 from logger import log
 
-_DEBOUNCE_SEC = 0.3
+# Anti-bounce window for toggle-mode press. Reduced from 0.3 → 0.1 s so
+# the first syllable of a phrase isn't cut off. Windows keydown autorepeat
+# period is ~30 ms — 100 ms safely absorbs that without eating real speech.
+_DEBOUNCE_SEC = 0.1
 
 
 class HotkeyListener:

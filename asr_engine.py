@@ -5,6 +5,7 @@ Single backend only. No factory, no switching.
 
 import threading
 import os
+import re
 import site
 import sys
 from pathlib import Path
@@ -12,6 +13,77 @@ from pathlib import Path
 import numpy as np
 from logger import log
 from models_registry import ModelSpec, nice_label, builtin_default_spec
+
+
+_PUNCT_RUN = re.compile(r"^[^\w]+|[^\w]+$")
+
+
+def _stitch_overlap_texts(pieces: list[str], overlap_samples: int, sr: int) -> str:
+    """Join overlapping transcription pieces, removing duplicated text in
+    the overlap region.
+
+    Strategy: walk adjacent pairs, find the longest suffix of piece[i]
+    that matches a prefix of piece[i+1] over a window of words. Keep that
+    shared span only once.
+
+    Comparison is *normalized*: the ASR decoder tends to restart a
+    "sentence" at a slice boundary (capitalising the first word, adding a
+    full stop, gluing commas to the previous word), so raw token matching
+    misses the overlap and duplicates the tail. We therefore compare
+    lowercase, edge-punctuation-stripped tokens, but always emit the
+    original tokens. The search window is capped by the real overlap
+    duration (approx. words per second), so a model hallucination that
+    "repeats" more than the physical overlap cannot eat genuine content.
+
+    Falls back to joining with a space if no good overlap match is found
+    (in which case the model just didn't repeat the boundary words).
+    """
+    if not pieces:
+        return ""
+    if len(pieces) == 1:
+        return pieces[0].strip()
+
+    def _tokenize(s: str) -> list[str]:
+        return [w for w in re.split(r"\s+", s.strip()) if w]
+
+    def _norm(w: str) -> str:
+        """Case- and edge-punctuation-insensitive form, used for comparison only."""
+        return _PUNCT_RUN.sub("", w.lower())
+
+    # Max words the real overlap can cover: speech ~4 words/sec, +2 safety.
+    overlap_secs = (overlap_samples or 0) / sr if sr else 0.0
+    cap = max(4, int(overlap_secs * 4) + 2) if overlap_secs > 0 else 12
+
+    def _lcp_suffix_prefix(a: list[str], b: list[str]) -> int:
+        """Longest k such that norm(a[-k:]) == norm(b[:k]). Capped at ``cap``."""
+        if not a or not b:
+            return 0
+        max_k = min(cap, len(a), len(b))
+        na = [_norm(w) for w in a]
+        nb = [_norm(w) for w in b]
+        for k in range(max_k, 0, -1):
+            if na[-k:] == nb[:k]:
+                return k
+        return 0
+
+    out_tokens: list[str] = []
+    prev_tokens: list[str] = []
+    for i, piece in enumerate(pieces):
+        tokens = _tokenize(piece)
+        if not tokens:
+            continue
+        if i == 0:
+            out_tokens.extend(tokens)
+            prev_tokens = tokens
+            continue
+        k = _lcp_suffix_prefix(prev_tokens, tokens)
+        if k > 0:
+            out_tokens.extend(tokens[k:])
+        else:
+            out_tokens.extend(tokens)
+        prev_tokens = tokens
+
+    return " ".join(out_tokens).strip()
 
 
 # ── CUDA DLL path registration (Windows) ───────────────────────────────────
@@ -266,6 +338,14 @@ class GigaAMEngine:
     # ── transcription ─────────────────────────────────────────────────────
 
     _CHUNK_SECONDS = 30  # Max chunk size before using chunked transcription
+    _SLICE_SECONDS = 4  # Slice length for short-audio overlap chunking
+    _SLICE_OVERLAP = 1.0  # Overlap between slices (helps CTC avoid mid-audio blanking)
+    _TAIL_PAD_SECONDS = 0.4  # Silence padding appended to each slice so CTC
+                              # doesn't blank the trailing words (a known
+                              # GigaAM v3 behaviour: the model needs a
+                              # silence tail to emit the final token).
+    _RNNT_MODEL_TYPE = "gigaam-v3-e2e-rnnt"  # Transducer models decode whole
+                                             # utterances — no CTC slicing.
 
     def _transcribe_locked(self, audio: np.ndarray) -> str:
         """Run ASR on a float32 waveform. Caller must hold ``self._lock``."""
@@ -283,19 +363,126 @@ class GigaAMEngine:
             chunk = audio[i:i + chunk_size]
             text = self._asr.recognize(chunk, sample_rate=self._sample_rate)
             texts.append(text)
-            log.info("Chunk %d: %.1fs audio -> %d chars", i // chunk_size, len(chunk) / self._sample_rate, len(text))
+            log.info("Chunk %d: %.1fs audio -> %d chars: %r", i // chunk_size,
+                     len(chunk) / self._sample_rate, len(text), text[:200])
 
         result = " ".join(texts)
         log.info("Chunked transcription: %d chars total", len(result))
         return result
 
+    def _transcribe_overlap_locked(self, audio: np.ndarray,
+                                   slice_seconds: float | None = None,
+                                   overlap_seconds: float | None = None) -> str:
+        """Transcribe short-to-medium audio with overlapping slices.
+
+        CTC models (GigaAM v3) tend to blank out on the *middle* of long
+        continuous speech when there's no clear silence break — even on a
+        single-pass recognize() of 4-12 s audio. Slicing into ~4 s windows
+        with 1 s overlap forces the model to re-attend to each region with
+        fresh context, dramatically reducing mid-utterance drops.
+
+        Each slice is also padded with a short silence tail (see
+        ``_TAIL_PAD_SECONDS``) so the CTC decoder emits its final token
+        instead of swallowing the last word into the silence region.
+
+        Slices are joined by stitching on the longest common suffix/prefix
+        of the words in the overlap region.
+
+        ``slice_seconds`` / ``overlap_seconds`` optionally override the
+        class defaults (used by RNN-T long-audio chunking).
+        """
+        self._load_locked()
+        sr = self._sample_rate
+        duration = len(audio) / sr
+        slice_len = int((slice_seconds if slice_seconds is not None else self._SLICE_SECONDS) * sr)
+        overlap = int((overlap_seconds if overlap_seconds is not None else self._SLICE_OVERLAP) * sr)
+        step = slice_len - overlap
+        tail_pad = int(self._TAIL_PAD_SECONDS * sr)
+
+        if len(audio) <= slice_len:
+            # Single slice: still pad with silence so the trailing words
+            # of an utterance that ends right at the recording boundary
+            # aren't lost to CTC silence-suppression.
+            padded = np.concatenate([audio, np.zeros(tail_pad, dtype=audio.dtype)])
+            return self._asr.recognize(padded, sample_rate=sr)
+
+        log.info("Overlap-slicing %.2fs audio: %ds slices, %.1fs overlap, %.2fs tail pad",
+                 duration, slice_len / sr, overlap / sr,
+                 self._TAIL_PAD_SECONDS)
+        pieces: list[str] = []
+        i = 0
+        idx = 0
+        while i < len(audio):
+            chunk = audio[i:i + slice_len]
+            if len(chunk) < int(0.3 * sr):  # < 0.3s tail — drop
+                break
+            # Append silence padding so the last word of each slice isn't
+            # swallowed by the decoder's silence region.
+            padded_chunk = np.concatenate([chunk, np.zeros(tail_pad, dtype=chunk.dtype)])
+            text = self._asr.recognize(padded_chunk, sample_rate=sr)
+            log.info("Slice %d (%.2fs -> %.2fs): %d chars: %r",
+                     idx, i / sr, min(i + len(chunk), len(audio)) / sr, len(text),
+                     text[:200])
+            pieces.append(text)
+            if i + len(chunk) >= len(audio):
+                break
+            i += step
+            idx += 1
+
+        return _stitch_overlap_texts(pieces, overlap_samples=overlap, sr=sr)
+
+    def _is_rnnt(self) -> bool:
+        """True when the active model is the E2E RNN-T (transducer)."""
+        try:
+            return self._resolved_spec().model_type == self._RNNT_MODEL_TYPE
+        except Exception:
+            return False
+
+    def _transcribe_rnnt_locked(self, audio: np.ndarray) -> str:
+        """Transcribe with the E2E RNN-T model — no CTC slicing.
+
+        The transducer decodes an utterance with full context in one pass;
+        cutting it into 4 s slices with 1 s overlap is what caused the
+        tail duplicates and word reordering (each slice "restarts" the
+        sentence, so boundary words get said twice and punctuation hops).
+        Audio up to ``_CHUNK_SECONDS`` (30 s) is therefore recognized as
+        a single unit (plus the silence tail pad so the final words are
+        not swallowed). Longer audio reuses overlap chunking with 30 s
+        slices so stitching still drops only the small true overlap.
+        """
+        self._load_locked()
+        sr = self._sample_rate
+        duration = len(audio) / sr
+        tail_pad = int(self._TAIL_PAD_SECONDS * sr)
+
+        if duration <= self._CHUNK_SECONDS:
+            padded = np.concatenate([audio, np.zeros(tail_pad, dtype=audio.dtype)])
+            text = self._asr.recognize(padded, sample_rate=sr)
+            log.info("RNN-T single pass: %.2fs audio -> %d chars: %r",
+                     duration, len(text), text[:200])
+            return text
+
+        log.info("RNN-T long audio (%.1fs): overlap chunking with %ds slices",
+                 duration, self._CHUNK_SECONDS)
+        return self._transcribe_overlap_locked(
+            audio, slice_seconds=float(self._CHUNK_SECONDS),
+            overlap_seconds=self._SLICE_OVERLAP)
+
     def transcribe(self, audio: np.ndarray) -> str:
         """Run ASR on a float32 waveform (mono, 16 kHz).
 
-        For audio longer than _CHUNK_SECONDS, splits into chunks and
-        transcribes each to work around ONNX model issues with very long audio.
+        The E2E RNN-T model decodes the whole utterance in one pass (no
+        slicing), because for a transducer the CTC-style 4 s overlap
+        slicing caused boundary words to be repeated/reordered. Longer
+        audio (>30 s) is chunked into 30 s overlapping slices. The CTC
+        models keep the existing 4 s overlap-slice path.
         """
         with self._lock:
+            if self._is_rnnt():
+                return self._transcribe_rnnt_locked(audio)
+            duration = len(audio) / self._sample_rate if self._sample_rate else 0
+            if duration <= self._CHUNK_SECONDS:
+                return self._transcribe_overlap_locked(audio)
             return self._transcribe_locked(audio)
 
 

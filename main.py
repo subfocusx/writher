@@ -29,8 +29,10 @@ import injector
 from hotkey import HotkeyListener
 from tray_icon import TrayIcon
 from widget import RecordingWidget
+from audio_preprocess import preprocess as audio_preprocess_fn
 import config
 import database as db
+import punct_normalize
 from notifier import ReminderScheduler
 from notes_window import NotesWindow
 from settings_window import SettingsWindow
@@ -89,6 +91,34 @@ def _load_settings():
         config.AUTOSTART = autostart_val == "1"
         import autostart
         autostart.set_autostart(config.AUTOSTART)
+
+    # Audio pre-processing flags are runtime-tunable from the Settings UI.
+    for flag, key in (
+        ("PP_NORMALIZE", "pp_normalize"),
+        ("PP_HIGHPASS", "pp_highpass"),
+        ("PP_DENOISE", "pp_denoise"),
+        ("PP_PREEMPHASIS", "pp_preemphasis"),
+    ):
+        val = db.get_setting(key, "")
+        if val != "":
+            setattr(config, flag, val == "1")
+
+
+def _apply_text_post(text):
+    """Post-process ASR text: punct_normalize rules (see config.PUNCT_*).
+
+    Never raises — on any rule failure the raw text is returned so dictation
+    is never lost to a formatting bug.
+    """
+    if not text:
+        return text
+    try:
+        if getattr(config, "PUNCT_ENABLED", True):
+            text = punct_normalize.normalize(
+                text, mode=getattr(config, "PUNCT_MODE", "full"))
+    except Exception as exc:
+        log.warning("Punct post-processing failed, using raw text: %s", exc)
+    return text
 
 
 # ── Toggle-mode timeout helpers ───────────────────────────────────────────
@@ -234,14 +264,51 @@ def _dictation_worker():
         text = None
         exc_info = None
 
+        # Pre-process audio: high-pass filter + peak normalize.
+        # Denoise / pre-emphasis are opt-in via settings (default off).
+        try:
+            pp_kwargs = {
+                "do_denoise": bool(getattr(config, "PP_DENOISE", False)),
+                "do_highpass": bool(getattr(config, "PP_HIGHPASS", True)),
+                "do_preemphasis": bool(getattr(config, "PP_PREEMPHASIS", False)),
+                "do_normalize": bool(getattr(config, "PP_NORMALIZE", True)),
+            }
+            processed = audio_preprocess_fn(item, sr=config.SAMPLE_RATE, **pp_kwargs)
+        except Exception as exc:
+            log.warning("Pre-process failed, using raw audio: %s", exc)
+            processed = item
+
         for attempt in range(2):
             try:
-                text = transcriber.transcribe(item)
+                text = _apply_text_post(transcriber.transcribe(processed))
                 break
             except Exception as exc:
                 exc_info = exc
                 if attempt == 0:
                     log.warning("First transcription attempt failed (%.100s), retrying", exc)
+
+        # Fallback: if the model returned empty text (CTC often does on
+        # short / quiet audio) AND the audio is at least 1.5 s long, retry
+        # once with pre-emphasis ON and high-pass OFF. This recovers the
+        # common "No speech detected" case from cheap USB mics where
+        # GigaAM CTC blanks out without a pre-emphasis boost.
+        if not text and not exc_info and len(item) / config.SAMPLE_RATE >= 1.5:
+            log.info("ASR returned empty text on %d-sample audio; retrying with pre-emphasis",
+                     len(item))
+            try:
+                fb_processed = audio_preprocess_fn(
+                    item,
+                    sr=config.SAMPLE_RATE,
+                    do_denoise=False,
+                    do_highpass=False,
+                    do_preemphasis=True,
+                    do_normalize=True,
+                )
+                text = _apply_text_post(transcriber.transcribe(fb_processed))
+                if text:
+                    log.info("Fallback transcription recovered %d chars", len(text))
+            except Exception as exc:
+                log.warning("Fallback transcription failed: %s", exc)
 
         if text:
             with _last_audio_lock:
@@ -289,7 +356,19 @@ def _on_retry():
         return
     _retry_last_time = now
     try:
-        text = transcriber.transcribe(last_audio)
+        # Same pre-processing as in the worker for consistency.
+        try:
+            pp_kwargs = {
+                "do_denoise": bool(getattr(config, "PP_DENOISE", False)),
+                "do_highpass": bool(getattr(config, "PP_HIGHPASS", True)),
+                "do_preemphasis": bool(getattr(config, "PP_PREEMPHASIS", False)),
+                "do_normalize": bool(getattr(config, "PP_NORMALIZE", True)),
+            }
+            processed = audio_preprocess_fn(last_audio, sr=config.SAMPLE_RATE, **pp_kwargs)
+        except Exception as exc:
+            log.warning("Pre-process failed in retry, using raw audio: %s", exc)
+            processed = last_audio
+        text = _apply_text_post(transcriber.transcribe(processed))
         if text:
             with _last_audio_lock:
                 global _last_transcribed_text

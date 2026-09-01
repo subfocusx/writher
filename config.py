@@ -30,3 +30,26 @@ VAD_THRESHOLD = 0.4
 
 # ── Windows autostart ──────────────────────────────────────────────────────
 AUTOSTART = False
+
+# ── Audio pre-processing ───────────────────────────────────────────────────
+# Each stage degrades gracefully if its dependency (scipy, noisereduce) is
+# not installed. Defaults tuned for typical Russian dictation: clear voice
+# + light background hum from a desk mic.
+#
+# 2026-08-31 retune for USB headsets (e.g. "High Definition Audio Device"):
+# - PP_HIGHPASS disabled: cheap USB mics already roll off below ~100 Hz, an
+#   80 Hz high-pass further attenuates low-frequency consonants (в/б/д) and
+#   makes sibilants at word boundaries harder to distinguish.
+# - PP_PREEMPHASIS enabled: GigaAM v3 was trained with pre-emphasis 0.97;
+#   without it, s/sh/shch/f at word boundaries come out clipped.
+PP_HIGHPASS = False     # 80 Hz Butterworth high-pass (OFF for USB mics)
+PP_NORMALIZE = True     # peak normalize to -3 dBFS before ASR
+PP_DENOISE = False      # spectral gating (noisereduce, optional, OFF by default)
+PP_PREEMPHASIS = True   # HF boost — required for GigaAM v3 to recognise fricatives
+
+# ── Post-processing of ASR text ─────────────────────────────────────────────
+# GigaAM punctuates unreliably; punct_normalize fixes the most common cases
+# (duplicate commas, dots mid-question, mechanical commas after pause words).
+# PUNCT_MODE "light" — structural cleanup only; "full" — + short-marker rules.
+PUNCT_ENABLED = True
+PUNCT_MODE = "full"

@@ -243,3 +243,103 @@ class TestRecorderConcurrency:
             else:
                 r._frames.append(np.zeros((480, 1), dtype=np.float32))
         assert r._frames == []
+
+
+class TestRecorderPreRoll:
+    """Tests for the pre-roll buffer that prevents the leading ~100-200 ms
+    of audio from being lost to PortAudio startup latency.
+
+    Bug fix (2026-08-31): the start() now opens the stream with recording
+    still False; the first _callback after stream.start() flips recording
+    to True and flushes the pre-roll buffer before the live frame.
+    """
+
+    def test_pre_roll_captures_frames_before_recording_starts(self):
+        """Frames arriving while recording=False go into _preroll, not _frames."""
+        from recorder import Recorder
+        r = Recorder()
+        r.recording = False
+        r._preroll = []
+        fake = np.zeros((480, 1), dtype=np.float32)
+        # Three callback invocations while the stream is open but recording
+        # hasn't started yet.
+        for _ in range(3):
+            r._callback(fake, 480, None, None)
+        assert r._frames == []           # live frames untouched
+        assert len(r._preroll) == 3      # pre-roll captured all 3
+
+    def test_pre_roll_capped_at_max(self):
+        """Pre-roll buffer is bounded so it can't grow forever."""
+        from recorder import Recorder
+        r = Recorder()
+        r.recording = False
+        r._preroll_max_frames = 4
+        fake = np.zeros((480, 1), dtype=np.float32)
+        for _ in range(20):
+            r._callback(fake, 480, None, None)
+        assert len(r._preroll) == 4  # capped, not unbounded
+
+    def test_first_recording_frame_flushes_pre_roll(self):
+        """When the first frame arrives after recording=True, pre-roll is
+        flushed BEFORE the live frame so no audio is lost."""
+        from recorder import Recorder
+        r = Recorder()
+        r.recording = False
+        r._preroll = []
+        pre = np.full((480, 1), 0.1, dtype=np.float32)
+        r._callback(pre, 480, None, None)   # pre-roll frame
+        r._callback(pre, 480, None, None)   # pre-roll frame
+        r.recording = True                   # user pressed hotkey
+        live = np.full((480, 1), 0.9, dtype=np.float32)
+        r._callback(live, 480, None, None)   # first real frame
+        # Order: 2 pre-roll, 1 live.
+        assert len(r._frames) == 3
+        assert np.array_equal(r._frames[0], pre)
+        assert np.array_equal(r._frames[1], pre)
+        assert np.array_equal(r._frames[2], live)
+        assert r._preroll == []  # flushed, no duplicates
+
+
+class TestRecorderDrain:
+    """Tests for the PortAudio drain delay added to stop() in 2026-08-31.
+
+    Bug fix: the previous stop() called stream.close() immediately after
+    stream.stop(), losing the trailing 50-100 ms (final sibilants and
+    consonants). The fix adds a short sleep so PortAudio can flush its
+    internal ring buffer.
+    """
+
+    def test_stop_drains_before_close(self, monkeypatch):
+        """stop() sleeps _drain_seconds between stream.stop() and close()."""
+        from recorder import Recorder
+        r = Recorder()
+        r._drain_seconds = 0.05
+        r.recording = True
+        r._sample_rate = 16000
+        # Fake a stream that records the order of stop/close calls.
+        calls = []
+        class FakeStream:
+            def stop(self): calls.append("stop")
+            def close(self): calls.append("close")
+        r._stream = FakeStream()
+        sleeps = []
+        monkeypatch.setattr("recorder.time.sleep", lambda s: sleeps.append(s))
+        r.stop()
+        assert calls == ["stop", "close"]   # stop before close
+        assert sleeps == [0.05]              # drain sleep happened
+
+    def test_stop_continues_when_drain_disabled(self, monkeypatch):
+        """Setting _drain_seconds=0 skips the sleep (no-op for tests)."""
+        from recorder import Recorder
+        r = Recorder()
+        r._drain_seconds = 0
+        r.recording = True
+        r._sample_rate = 16000
+        class FakeStream:
+            def stop(self): pass
+            def close(self): pass
+        r._stream = FakeStream()
+        sleeps = []
+        monkeypatch.setattr("recorder.time.sleep", lambda s: sleeps.append(s))
+        r.stop()
+        assert sleeps == []

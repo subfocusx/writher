@@ -6,6 +6,34 @@ import types
 import threading
 import pytest
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Skip test modules that need optional dependencies not present in this
+# environment (the project's embedded Python on Windows ships without
+# tkinter by design). This is the recommended pytest pattern: missing
+# optional dep → skip collection, not a hard collection error.
+# ─────────────────────────────────────────────────────────────────────────────
+collect_ignore_glob = []
+
+try:
+    import tkinter  # noqa: F401
+except Exception:
+    # The embedded Python that ships with the project (`.python\python.exe`)
+    # doesn't include tkinter by design — adding it would mean downloading
+    # tcl/tk DLLs and stitching them into the project, which contradicts the
+    # "не засирай" constraint. These tests pass on a full Python install
+    # (e.g. python.org 3.11.x); here we just skip collection with a clear
+    # reason so the suite as a whole still runs.
+    #
+    # Files excluded: any that either pull tkinter at top level (widget,
+    # notes_window, settings_window) or that exercise the full main.py
+    # module which itself does `import tkinter as tk` at line 9.
+    collect_ignore_glob.extend([
+        "test_widget_helpers.py",
+        "test_notes_window.py",
+        "test_settings_window_logic.py",
+        "test_main_bug.py",        # imports main.py which needs tkinter
+    ])
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FakeWinreg — for autostart tests that mock Windows registry
@@ -329,6 +357,19 @@ def main_module(monkeypatch, tmp_path):
         make_stub("database",
             init=lambda: None,
             get_setting=lambda k, d="": d))
+    # notes_window pulls tkinter/customtkinter at import time. We never call
+    # the real one in these tests — main.py just stores a reference.
+    monkeypatch.setitem(sys.modules, "notes_window",
+        make_stub("notes_window", NotesWindow=lambda r: object()))
+    # models_registry only needs logger; we already stub logger below if
+    # it isn't already loaded.
+    try:
+        import models_registry  # noqa: F401
+    except Exception:
+        monkeypatch.setitem(sys.modules, "models_registry",
+            make_stub("models_registry",
+                ModelSpec=lambda **kw: None,
+                discover_models=lambda: []))
 
     # ── import main ────────────────────────────────────────────────────────
     import main as m

@@ -28,6 +28,14 @@ _STRINGS: dict[str, dict[str, str]] = {
         "setting_asr_model_choose_title": "Select a folder with ASR models",
         "setting_asr_model_loading":     "Switching model...",
         "setting_asr_model_empty":       "No models found. Add a folder or refresh.",
+
+        # Recognition accuracy
+        "setting_accuracy":          "Recognition accuracy",
+        "setting_pp_normalize":      "Normalize volume",
+        "setting_pp_highpass":       "High-pass filter",
+        "setting_pp_denoise":        "Noise reduction",
+        "setting_pp_preemphasis":    "Pre-emphasis",
+        "setting_pp_hint":           "Audio pre-processing stages applied before recognition. Changes take effect from the next dictation.",
     },
     "ru": {
         # tray_icon.py
@@ -54,6 +62,14 @@ _STRINGS: dict[str, dict[str, str]] = {
         "setting_asr_model_choose_title": "Выберите папку с моделями ASR",
         "setting_asr_model_loading":     "Переключение модели...",
         "setting_asr_model_empty":       "Модели не найдены. Добавьте папку или обновите.",
+
+        # Recognition accuracy
+        "setting_accuracy":          "Точность распознавания",
+        "setting_pp_normalize":      "Нормализация громкости",
+        "setting_pp_highpass":       "High-pass фильтр",
+        "setting_pp_denoise":        "Шумоподавление",
+        "setting_pp_preemphasis":    "Pre-emphasis",
+        "setting_pp_hint":           "Этапы обработки звука перед распознаванием. Применяются со следующей диктовки.",
     },
 }
 

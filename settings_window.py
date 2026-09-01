@@ -53,6 +53,8 @@ class SettingsWindow:
         self._models_dir = db.get_setting("asr_models_dir", "") or None
         # Autostart
         self._autostart_switch = None
+        # Recognition accuracy (audio pre-processing toggles)
+        self._pp_switches = {}
 
     def show(self):
         if self._win is not None:
@@ -292,7 +294,37 @@ class SettingsWindow:
 
         self._build_separator(pad)
 
-        # ── 4. Autostart ─────────────────────────────────────────────
+        # ── 4. Recognition accuracy ──────────────────────────────────
+        self._build_section_label(pad, locales.get("setting_accuracy"))
+
+        hint = ctk.CTkLabel(
+            pad, text=locales.get("setting_pp_hint"),
+            font=T.FONT_SMALL, text_color=T.FG_DIM, anchor="w", wraplength=390,
+        )
+        hint.pack(fill="x", pady=(0, T.PAD_S))
+
+        for flag, key, text in (
+            ("PP_NORMALIZE", "pp_normalize", locales.get("setting_pp_normalize")),
+            ("PP_HIGHPASS", "pp_highpass", locales.get("setting_pp_highpass")),
+            ("PP_DENOISE", "pp_denoise", locales.get("setting_pp_denoise")),
+            ("PP_PREEMPHASIS", "pp_preemphasis", locales.get("setting_pp_preemphasis")),
+        ):
+            row = ctk.CTkFrame(pad, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=text, font=T.FONT_SMALL,
+                         text_color=T.FG, anchor="w").pack(side="left")
+            sw = ctk.CTkSwitch(
+                row, text="",
+                fg_color=T.BG_INPUT, progress_color=T.ACCENT,
+                button_color=T.ACCENT, button_hover_color=T.ACCENT_HOVER,
+                command=lambda f=flag, k=key: self._on_pp_toggle(f, k),
+            )
+            sw.pack(side="right")
+            self._pp_switches[key] = sw
+
+        self._build_separator(pad)
+
+        # ── 5. Autostart ─────────────────────────────────────────────
         self._build_section_label(pad, locales.get("setting_autostart"))
 
         self._autostart_switch = ctk.CTkSwitch(
@@ -365,6 +397,21 @@ class SettingsWindow:
             self._autostart_switch.select() if autostart.is_autostart_enabled() \
                 else self._autostart_switch.deselect()
 
+        for flag, key in (
+            ("PP_NORMALIZE", "pp_normalize"),
+            ("PP_HIGHPASS", "pp_highpass"),
+            ("PP_DENOISE", "pp_denoise"),
+            ("PP_PREEMPHASIS", "pp_preemphasis"),
+        ):
+            sw = self._pp_switches.get(key)
+            if sw is None:
+                continue
+            on = bool(getattr(config, flag, False))
+            if on:
+                sw.select()
+            else:
+                sw.deselect()
+
     def _update_mode_buttons(self, hold: bool):
         if self._hold_btn:
             if hold:
@@ -435,6 +482,14 @@ class SettingsWindow:
             log.warning("Autostart not supported on this platform.")
             self._autostart_switch.select() if autostart.is_autostart_enabled() \
                 else self._autostart_switch.deselect()
+
+    def _on_pp_toggle(self, flag: str, key: str):
+        """Audio pre-processing switch — live effect on the next dictation."""
+        sw = self._pp_switches.get(key)
+        enabled = bool(sw.get()) if sw is not None else bool(getattr(config, flag, False))
+        setattr(config, flag, enabled)
+        db.save_setting(key, "1" if enabled else "0")
+        log.info("Pre-processing %s -> %s", flag, enabled)
 
     # ── Microphone helpers ────────────────────────────────────────────────
 

@@ -5,6 +5,9 @@ eliminating the race condition that existed with pyperclip.
 Uses keybd_event with hardware scan codes to simulate Ctrl+V — the proven
 method from boppreh/keyboard (4k+ stars) that works reliably on Windows 10/11.
 If clipboard injection fails, text is saved to recovery_notes.txt as fallback.
+
+The original clipboard content is saved before injection and restored afterwards,
+so the user never loses what they had copied before dictation.
 """
 
 import ctypes
@@ -59,6 +62,7 @@ GMEM_MOVEABLE = 0x0002
 
 _MAX_RETRIES = 5
 _RETRY_DELAY = 0.02  # seconds
+_PASTE_WAIT = 1.0  # seconds — time to wait for target app to read clipboard
 
 
 # ── Clipboard helpers ─────────────────────────────────────────────────────
@@ -115,16 +119,90 @@ def _set_clipboard_text(text: str) -> bool:
         _CloseClipboard()
 
 
+def _clear_clipboard() -> bool:
+    """Empty the clipboard. Returns True on success.
+
+    Fallback: called only when clipboard restore fails (see inject()).
+    The text is already saved to recovery_notes.txt, so nothing is lost.
+    """
+    if not _open_clipboard():
+        log.warning("Cannot open clipboard for clearing")
+        return False
+    try:
+        _EmptyClipboard()
+        return True
+    finally:
+        _CloseClipboard()
+
+
 # ── Recovery file ─────────────────────────────────────────────────────────
+
+
+def _current_user_account() -> str:
+    """Return the current user's account name (DOMAIN\\user) for ACL grants.
+
+    Resolved from the process token rather than the USERNAME environment
+    variable. The env var can name an orphaned / renamed account or simply
+    be absent in odd launchers — granting to it permanently locks the file
+    (the ACL bug that broke WritHer 1.1.0). The token never lies.
+    """
+    import ctypes as _c
+    try:
+        size = _c.wintypes.DWORD(256)
+        buf = _c.create_unicode_buffer(size.value)
+        if _c.windll.advapi32.GetUserNameW(buf, _c.byref(size)):
+            return buf.value
+    except Exception:
+        pass
+    # Fall back to the env var, but keep the raw login name only.
+    return (os.environ.get("USERNAME") or os.environ.get("USER") or "")
+
+
+def _safe_harden_recovery():
+    """Best-effort: grant the current user FullControl on the recovery file.
+
+    Designed so it can NEVER lock the app out of its own file:
+      * the grant goes to the real process-user, not a stale env var;
+      * inheritance is kept (no destructive `/inheritance:r`), so even if
+        the grant is wrong the parent folder's rights still apply;
+      * we verify writability afterwards and, if it broke, re-enable
+        inheritance to self-heal.
+    Failures are logged, never fatal — the text is already appended.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import subprocess
+        user = _current_user_account()
+        if not user:
+            return
+        _run_icacls(["icacls", RECOVERY_PATH, "/grant", f"{user}:F"])
+        # Verify we still hold write access; if not, restore inheritance.
+        try:
+            with open(RECOVERY_PATH, "a", encoding="utf-8"):
+                pass
+        except OSError:
+            _run_icacls(["icacls", RECOVERY_PATH, "/inheritance:e"])
+    except Exception as exc:
+        log.warning("ACL hardening skipped: %s", exc)
+
+
+def _run_icacls(args: list[str]):
+    import subprocess
+    try:
+        subprocess.run(args, check=False, capture_output=True, timeout=2)
+    except Exception:
+        pass
 
 
 def _save_recovery(text: str):
     """Append text to recovery_notes.txt. Rotates when file exceeds 500 KB.
 
-    On Windows, the first time the file is created we attempt to restrict
-    its ACL to the current user only (strip inherited ACLs, grant current
-    user full control). Subsequent appends skip the icacls call — it's
-    a heavyweight subprocess and not needed on every dictation.
+    On Windows we try to ensure the current user has FullControl on the
+    file, hardened so it can never lock the app out (see
+    ``_safe_harden_recovery``). The old ``/inheritance:r`` + env-var grant
+    permanently broke the file (Permission denied on every dictation) when
+    the USERNAME env var didn't match the real account — that bug is gone.
     """
     try:
         # Rotate if too large
@@ -137,30 +215,13 @@ def _save_recovery(text: str):
 
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        is_new_file = not os.path.exists(RECOVERY_PATH)
+        first_write = not os.path.exists(RECOVERY_PATH)
         with open(RECOVERY_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {text}\n")
 
-        # Best-effort ACL hardening on first creation. We only do this
-        # once per file to avoid a subprocess call on every dictation.
-        if is_new_file and os.name == "nt":
-            try:
-                import subprocess
-                user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
-                if user:
-                    subprocess.run(
-                        [
-                            "icacls", RECOVERY_PATH,
-                            "/inheritance:r",
-                            "/grant:r", f"{user}:F",
-                        ],
-                        check=False,
-                        capture_output=True,
-                        timeout=2,
-                    )
-            except Exception:
-                # Non-fatal: file is still saved, just not ACL-hardened.
-                pass
+        # Ensure the current user can always write, once after creation.
+        if first_write:
+            _safe_harden_recovery()
     except Exception as exc:
         log.error("Failed to save recovery text: %s", exc)
 
@@ -231,10 +292,16 @@ def _send_ctrl_v(target_hwnd=None):
     # 2. Send Ctrl down, V down, V up, Ctrl up — with scan codes set in dwFlags.
     #    keybd_event takes (bVk, bScan, dwFlags, dwExtraInfo).
     #    When KEYEVENTF_SCANCODE is set, bVk is ignored and bScan is used.
+    #    Small sleeps between events prevent fast machines from collapsing
+    #    down/up into a single keystroke that target apps can't recognise
+    #    as a Ctrl+V chord (commonly reported symptom: nothing pastes).
     try:
         _user32.keybd_event(0, SCAN_CTRL, KEYEVENTF_SCANCODE, 0)
+        time.sleep(0.02)
         _user32.keybd_event(0, SCAN_V,    KEYEVENTF_SCANCODE, 0)
+        time.sleep(0.02)
         _user32.keybd_event(0, SCAN_V,    KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0)
+        time.sleep(0.02)
         _user32.keybd_event(0, SCAN_CTRL, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0)
     except Exception as exc:
         log.error("keybd_event failed: %s", exc)
@@ -249,6 +316,9 @@ def inject(text: str, target_hwnd=None):
     Every transcription is saved to recovery_notes.txt as a safety net,
     so dictated content is never lost even if the paste target ignores Ctrl+V.
 
+    The user's original clipboard content is saved before injection and
+    restored afterwards, so nothing the user had copied is lost.
+
     Args:
         text: Transcribed text to paste.
         target_hwnd: Window handle to restore and receive Ctrl+V. If None,
@@ -261,6 +331,11 @@ def inject(text: str, target_hwnd=None):
     # Always save to recovery file — paste target may silently ignore Ctrl+V
     _save_recovery(text)
 
+    # Save the user's original clipboard content so we can restore it after
+    # the paste. If the clipboard contains non-text data (image, file list),
+    # _get_clipboard_text returns "" which is fine — we'll restore empty.
+    original_clipboard = _get_clipboard_text()
+
     try:
         if not _set_clipboard_text(text):
             log.error("Failed to set clipboard text (already saved to recovery)")
@@ -271,7 +346,24 @@ def inject(text: str, target_hwnd=None):
         # Simulate Ctrl+V using hardware scan codes (proven, see module docstring)
         _send_ctrl_v(target_hwnd)
 
-        # Keep the new text in clipboard — user can Ctrl+V manually if auto-paste fails
+        # Wait for the target window to actually consume the paste before we
+        # restore the clipboard. Heavy editors (Word, big contenteditable,
+        # Electron apps) can take 300-600+ ms to read the clipboard after
+        # receiving Ctrl+V — too short and the paste silently drops, and
+        # then our restore wipes the buffer ("в буфер не попадает" symptom).
+        # Recovery file already has the text.
+        time.sleep(_PASTE_WAIT)
+
+        # Restore the original clipboard content so the user never loses
+        # what they had copied before dictation. If restore fails, fall
+        # back to clearing — the dictated text is in recovery_notes.txt.
+        if original_clipboard:
+            if not _set_clipboard_text(original_clipboard):
+                log.warning("Could not restore original clipboard, clearing instead")
+                _clear_clipboard()
+        else:
+            _clear_clipboard()
     except Exception as exc:
         log.error("Injection error: %s", exc)
-        # Keep clipboard content on error — user can Ctrl+V manually
+        # On error, leave whatever's in the clipboard — better to re-paste
+        # the dictated text than to lose it. The text is in recovery too.
