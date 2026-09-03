@@ -51,7 +51,7 @@ Process stays alive in tray. Killing the smoke-test process does not crash anyth
 
 ```powershell
 .\.python\python.exe -m pytest -q
-# 487 passed, 1 skipped, 7 warnings in ~20s
+# 548 passed, 1 skipped, 7 warnings in ~25s
 ```
 
 ### Bug fixes added 2026-08-31 — five new tests cover them
@@ -128,6 +128,30 @@ the target app and the buffer was empty. Two root causes, both fixed in
    500 ms. Recovery file already has the text either way, but the
    user's screen now actually receives it. New test:
    `TestInjectPostPasteDelay` (1 case).
+
+### Bug fixes added 2026-09-01 — clipboard injection into slow targets (Electron / Chrome)
+
+User reported "текст не появляется" (text never appears) when dictating into
+DSH Web (Electron) and Google Sheets in Chrome. Fixes in `injector.py`:
+
+1. **`_PASTE_WAIT` 1.0s → 2.0s** — Electron and Chrome can take 600-1500 ms
+   to read the clipboard after Ctrl+V on a busy machine; 1.0s often meant
+   we restored the user's old clipboard before the target read ours, and
+   the paste silently dropped.
+2. **Stale-hwnd fallback (`_resolve_target_hwnd`)** — if the saved target
+   window is no longer the foreground window (user switched apps during a
+   long dictation), Ctrl+V is redirected to the current foreground window
+   instead of being pushed into the stale one.
+3. **Silent-drop detection (`_did_paste_land`)** — after the wait, if the
+   target neither became the foreground nor consumed the text (it still
+   sits unmodified in the clipboard), we assume the paste was swallowed
+   and keep the dictated text in the clipboard for
+   `_KEEP_DICTATED_IN_CLIPBOARD` (30 s) so the user can Ctrl+V it manually;
+   a daemon thread then restores the original clipboard content.
+   On any exception the code stays optimistic (restore on schedule).
+
+New tests: `TestPasteLandHelpers`, `TestPasteWaitAndKeepInClipboard`
+(18 cases in `tests/test_injector.py`). Commit `d385fb8`.
 
 ## Bundle
 
