@@ -8,11 +8,24 @@ If clipboard injection fails, text is saved to recovery_notes.txt as fallback.
 
 The original clipboard content is saved before injection and restored afterwards,
 so the user never loses what they had copied before dictation.
+
+Differences from the original v1.1.0 (2026-09-01):
+  * _PASTE_WAIT raised 1.0s -> 2.0s (Electron / Google Sheets in Chrome
+    need 600-1500 ms to read the clipboard after Ctrl+V; 1s was the main
+    cause of the "text never appears" symptom).
+  * If the saved target hwnd is no longer the foreground window (user
+    switched apps during a long dictation), fall back to the current
+    foreground so Ctrl+V lands somewhere visible.
+  * If the paste target did not consume the dictated text within
+    _PASTE_WAIT, keep it in the clipboard for _KEEP_DICTATED_IN_CLIPBOARD
+    seconds so the user can Ctrl+V it manually, then auto-restore the
+    original clipboard content.
 """
 
 import ctypes
 import ctypes.wintypes
 import os
+import threading
 import time
 
 from logger import log
@@ -62,7 +75,19 @@ GMEM_MOVEABLE = 0x0002
 
 _MAX_RETRIES = 5
 _RETRY_DELAY = 0.02  # seconds
-_PASTE_WAIT = 1.0  # seconds — time to wait for target app to read clipboard
+
+# Time to wait for the target app to actually read the clipboard after Ctrl+V
+# before we restore the user's original clipboard content.
+# Bumped 1.0s -> 2.0s: DSH Web (Electron) and Google Sheets in Chrome can
+# take 600-1500 ms on busy machines; 1.0s often caused the paste to land
+# on a clipboard we were already overwriting (the "text never appears" bug).
+_PASTE_WAIT = 2.0
+
+# When the target app silently swallows Ctrl+V (Electron, contenteditable,
+# IME-on, etc.), keep the dictated text in the clipboard this long so the
+# user can paste it manually with Ctrl+V. After the grace period we restore
+# the original clipboard content.
+_KEEP_DICTATED_IN_CLIPBOARD = 30.0
 
 
 # ── Clipboard helpers ─────────────────────────────────────────────────────
@@ -264,6 +289,10 @@ _IsIconic = _user32.IsIconic
 _IsIconic.argtypes = [ctypes.wintypes.HWND]
 _IsIconic.restype = ctypes.wintypes.BOOL
 
+_GetForegroundWindow = _user32.GetForegroundWindow
+_GetForegroundWindow.argtypes = []
+_GetForegroundWindow.restype = ctypes.wintypes.HWND
+
 
 def _send_ctrl_v(target_hwnd=None):
     """Simulate Ctrl+V via keybd_event with hardware scan codes.
@@ -307,6 +336,61 @@ def _send_ctrl_v(target_hwnd=None):
         log.error("keybd_event failed: %s", exc)
 
 
+# ── NEW (v1.1.0 patch): focus / paste-land helpers ────────────────────────
+
+
+def _get_foreground_hwnd() -> int:
+    """Return the current foreground window handle, or 0 on failure."""
+    try:
+        return int(_GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _resolve_target_hwnd(saved_hwnd) -> int:
+    """Pick the window to receive Ctrl+V.
+
+    If the saved hwnd is still the foreground window, use it. Otherwise
+    fall back to the current foreground — the user almost certainly moved
+    away during a long dictation, and pushing Ctrl+V into the stale window
+    is what causes "paste disappeared" reports.
+    """
+    try:
+        saved = int(saved_hwnd or 0)
+    except (TypeError, ValueError):
+        saved = 0
+    cur = _get_foreground_hwnd()
+    if saved and cur == saved:
+        return saved
+    # Stale hwnd — use current foreground (or saved as last resort).
+    return cur or saved
+
+
+def _did_paste_land(expected_text: str, target_hwnd: int) -> bool:
+    """Heuristic: did the target window actually consume the paste?
+
+    We can't read the target's text buffer, so we use two cheap signals:
+      1. The foreground window equals the target we tried to paste into —
+         most apps focus the field they paste into, so the foreground
+         usually tracks the active editor.
+      2. The clipboard no longer contains our dictated text. Many apps
+         pull the data via OLE/CF_UNICODETEXT during the paste, which may
+         clear or replace the clipboard. If our text is still there, the
+         target didn't consume it.
+
+    Returns True if either signal looks healthy, False = "silent drop".
+    """
+    try:
+        if target_hwnd and _get_foreground_hwnd() == target_hwnd:
+            return True
+        cur = _get_clipboard_text()
+        return cur != expected_text
+    except Exception:
+        # If we can't tell, be optimistic — assume the paste worked and
+        # restore the original clipboard on schedule.
+        return True
+
+
 # ── Public API ────────────────────────────────────────────────────────────
 
 
@@ -336,6 +420,7 @@ def inject(text: str, target_hwnd=None):
     # _get_clipboard_text returns "" which is fine — we'll restore empty.
     original_clipboard = _get_clipboard_text()
 
+    paste_ok = False
     try:
         if not _set_clipboard_text(text):
             log.error("Failed to set clipboard text (already saved to recovery)")
@@ -343,26 +428,50 @@ def inject(text: str, target_hwnd=None):
         # Brief pause so the clipboard is committed before we synthesise keys
         time.sleep(0.05)
 
+        # NEW: prefer the current foreground window if the saved hwnd is stale.
+        # A long dictation is a long time for the user to be in the same window.
+        target_hwnd = _resolve_target_hwnd(target_hwnd)
+
         # Simulate Ctrl+V using hardware scan codes (proven, see module docstring)
         _send_ctrl_v(target_hwnd)
 
         # Wait for the target window to actually consume the paste before we
-        # restore the clipboard. Heavy editors (Word, big contenteditable,
-        # Electron apps) can take 300-600+ ms to read the clipboard after
-        # receiving Ctrl+V — too short and the paste silently drops, and
-        # then our restore wipes the buffer ("в буфер не попадает" symptom).
-        # Recovery file already has the text.
+        # restore the clipboard. 2.0s (was 1.0s) — DSH Web (Electron) and
+        # Google Sheets in Chrome can take 600-1500 ms on busy machines.
         time.sleep(_PASTE_WAIT)
+        paste_ok = _did_paste_land(text, target_hwnd)
 
-        # Restore the original clipboard content so the user never loses
-        # what they had copied before dictation. If restore fails, fall
-        # back to clearing — the dictated text is in recovery_notes.txt.
-        if original_clipboard:
-            if not _set_clipboard_text(original_clipboard):
-                log.warning("Could not restore original clipboard, clearing instead")
+        if paste_ok:
+            # Restore the original clipboard content so the user never loses
+            # what they had copied before dictation.
+            if original_clipboard:
+                if not _set_clipboard_text(original_clipboard):
+                    log.warning("Could not restore original clipboard, clearing instead")
+                    _clear_clipboard()
+            else:
                 _clear_clipboard()
         else:
-            _clear_clipboard()
+            # Paste target silently swallowed Ctrl+V (common with Electron,
+            # big contenteditable, IME-on). Keep the dictated text in the
+            # clipboard for _KEEP_DICTATED_IN_CLIPBOARD seconds so the user
+            # can Ctrl+V it manually. After that, restore the original.
+            log.warning(
+                "Paste not consumed by target hwnd=%s; keeping dictated text "
+                "in clipboard for %ss for manual paste",
+                target_hwnd, _KEEP_DICTATED_IN_CLIPBOARD,
+            )
+
+            def _restore_later():
+                time.sleep(_KEEP_DICTATED_IN_CLIPBOARD)
+                try:
+                    if original_clipboard:
+                        _set_clipboard_text(original_clipboard)
+                    else:
+                        _clear_clipboard()
+                except Exception as exc:
+                    log.warning("Deferred clipboard restore failed: %s", exc)
+
+            threading.Thread(target=_restore_later, daemon=True).start()
     except Exception as exc:
         log.error("Injection error: %s", exc)
         # On error, leave whatever's in the clipboard — better to re-paste

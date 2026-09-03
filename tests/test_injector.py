@@ -261,3 +261,188 @@ class TestInjectPostPasteDelay:
         injector.inject("диктуемый текст", 0x1234)
 
         assert len(cleared) == 1
+
+
+class TestPasteLandHelpers:
+    """Tests for the v1.1.0 patch helpers: stale-hwnd fallback
+    (_resolve_target_hwnd) and paste-land heuristic (_did_paste_land)."""
+
+    def test_resolve_target_hwnd_keeps_saved_when_foreground(self, monkeypatch):
+        """Saved hwnd == foreground → use the saved window."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0x1234)
+        assert injector._resolve_target_hwnd(0x1234) == 0x1234
+
+    def test_resolve_target_hwnd_falls_back_to_foreground_when_stale(self, monkeypatch):
+        """Saved hwnd is stale (user switched apps) → use current foreground."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0xABCD)
+        assert injector._resolve_target_hwnd(0x1234) == 0xABCD
+
+    def test_resolve_target_hwnd_foreground_wins_when_saved_missing(self, monkeypatch):
+        """target_hwnd=None → current foreground window."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0xABCD)
+        assert injector._resolve_target_hwnd(None) == 0xABCD
+
+    def test_resolve_target_hwnd_saved_fallback_when_no_foreground(self, monkeypatch):
+        """No foreground (hwnd=0) → keep the saved window as last resort."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0)
+        assert injector._resolve_target_hwnd(0x1234) == 0x1234
+
+    def test_resolve_target_hwnd_zero_when_nothing(self, monkeypatch):
+        """No saved hwnd and no foreground → 0 (send to foreground anyway)."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0)
+        assert injector._resolve_target_hwnd(None) == 0
+
+    def test_did_paste_land_foreground_match(self, monkeypatch):
+        """Target is the foreground window → paste landed."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0x1234)
+        assert injector._did_paste_land("текст", 0x1234) is True
+
+    def test_did_paste_land_clipboard_consumed(self, monkeypatch):
+        """Target consumed the text (clipboard no longer holds it) → landed."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0x1111)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "что-то другое")
+        assert injector._did_paste_land("текст", 0x1234) is True
+
+    def test_did_paste_land_silent_drop(self, monkeypatch):
+        """Foreground differs AND text still in clipboard → silent drop."""
+        import injector
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", lambda: 0x1111)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "текст")
+        assert injector._did_paste_land("текст", 0x1234) is False
+
+    def test_did_paste_land_exception_is_optimistic(self, monkeypatch):
+        """On any error assume the paste landed (restore on schedule)."""
+        import injector
+
+        def boom():
+            raise RuntimeError("no window")
+
+        monkeypatch.setattr(injector, "_get_foreground_hwnd", boom)
+        monkeypatch.setattr(injector, "_get_clipboard_text", boom)
+        assert injector._did_paste_land("текст", 0x1234) is True
+
+
+class TestPasteWaitAndKeepInClipboard:
+    """Constants of the v1.1.0 patch: 2s paste window + 30s keep-in-clipboard
+    grace period for manual Ctrl+V when the target swallows the paste."""
+
+    def test_paste_wait_at_least_two_seconds(self):
+        """_PASTE_WAIT was bumped 1.0s → 2.0s for slow Electron/Chrome targets."""
+        from injector import _PASTE_WAIT
+        assert _PASTE_WAIT >= 2.0
+
+    def test_keep_dictated_in_clipboard_positive(self):
+        from injector import _KEEP_DICTATED_IN_CLIPBOARD
+        assert _KEEP_DICTATED_IN_CLIPBOARD > 0
+
+    def test_keep_dictated_longer_than_paste_wait(self):
+        from injector import _PASTE_WAIT, _KEEP_DICTATED_IN_CLIPBOARD
+        assert _KEEP_DICTATED_IN_CLIPBOARD > _PASTE_WAIT
+
+    def test_inject_does_not_clear_clipboard_on_silent_drop(self, monkeypatch):
+        """When the target swallows Ctrl+V the dictated text must stay in the
+        clipboard (manual Ctrl+V grace period), not be cleared synchronously."""
+        import injector
+
+        clears = []
+
+        class _FakeThread:
+            def start(self):
+                self.started = True
+
+        captured = {}
+
+        def fake_thread(target=None, daemon=None, *a, **k):
+            captured["target"] = target
+            captured["daemon"] = daemon
+            return _FakeThread()
+
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        monkeypatch.setattr(injector, "_resolve_target_hwnd", lambda h: 0x1234)
+        monkeypatch.setattr(injector, "_did_paste_land", lambda _t, _h: False)
+        monkeypatch.setattr(injector, "_clear_clipboard", lambda: clears.append(True) or True)
+        monkeypatch.setattr(injector, "_set_clipboard_text", lambda _t: True)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "диктуемый")
+        monkeypatch.setattr(injector.time, "sleep", lambda s: None)
+        monkeypatch.setattr(injector.threading, "Thread", fake_thread)
+
+        injector.inject("диктуемый текст", 0x1234)
+
+        # Clipboard is NOT cleared synchronously; a daemon restore is scheduled.
+        assert clears == []
+        assert captured["daemon"] is True
+        assert captured["target"] is not None
+
+    def test_deferred_restore_returns_original_clipboard(self, monkeypatch):
+        """The delayed restore puts the user's original content back."""
+        import injector
+
+        sets = []
+
+        class _FakeThread:
+            def start(self):
+                self.started = True
+
+        captured = {}
+
+        def fake_thread(target=None, daemon=None, *a, **k):
+            captured["target"] = target
+            return _FakeThread()
+
+        def fake_set(t):
+            sets.append(t)
+            return True
+
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        monkeypatch.setattr(injector, "_resolve_target_hwnd", lambda h: 0x1234)
+        monkeypatch.setattr(injector, "_did_paste_land", lambda _t, _h: False)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "старое")
+        monkeypatch.setattr(injector, "_set_clipboard_text", fake_set)
+        monkeypatch.setattr(injector, "_clear_clipboard", lambda: True)
+        monkeypatch.setattr(injector.time, "sleep", lambda s: None)
+        monkeypatch.setattr(injector.threading, "Thread", fake_thread)
+
+        injector.inject("диктуемый текст", 0x1234)
+
+        # Run the deferred restore body with no-op sleep.
+        sets.clear()
+        captured["target"]()
+        assert sets == ["старое"]
+
+    def test_deferred_restore_clears_when_no_original(self, monkeypatch):
+        """If the original clipboard was empty, the delayed restore clears it."""
+        import injector
+
+        cleared = []
+
+        class _FakeThread:
+            def start(self):
+                self.started = True
+
+        captured = {}
+
+        def fake_thread(target=None, daemon=None, *a, **k):
+            captured["target"] = target
+            return _FakeThread()
+
+        monkeypatch.setattr(injector, "_send_ctrl_v", lambda _hwnd: None)
+        monkeypatch.setattr(injector, "_resolve_target_hwnd", lambda h: 0x1234)
+        monkeypatch.setattr(injector, "_did_paste_land", lambda _t, _h: False)
+        monkeypatch.setattr(injector, "_get_clipboard_text", lambda: "")
+        monkeypatch.setattr(injector, "_set_clipboard_text", lambda _t: True)
+        monkeypatch.setattr(injector, "_clear_clipboard", lambda: cleared.append(True) or True)
+        monkeypatch.setattr(injector.time, "sleep", lambda s: None)
+        monkeypatch.setattr(injector.threading, "Thread", fake_thread)
+
+        injector.inject("диктуемый текст", 0x1234)
+
+        cleared.clear()
+        captured["target"]()
+        assert len(cleared) == 1
