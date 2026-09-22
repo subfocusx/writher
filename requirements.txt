@@ -6,6 +6,9 @@ Pillow>=10.0.0
 winotify>=1.1.0
 customtkinter>=5.2.0
 soundfile>=0.12.0
+# soxr — best resampler backend (priority soxr → scipy → np.interp), used op-
+# tionally by recorder if installed; declared to guarantee HQ on fresh installs.
+soxr>=1.0.0
 
 # Silero VAD — voice activity detection (toggle-mode auto-stop)
 silero-vad>=4.0.0

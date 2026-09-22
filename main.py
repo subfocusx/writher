@@ -475,8 +475,14 @@ def main():
     )
     tray.start()
 
-    # Warmup model in background so UI stays responsive
-    threading.Thread(target=transcriber.warmup, daemon=True).start()
+    # Warmup model + preload VAD in background so UI stays responsive
+    # and the first toggle-mode dictation isn't delayed by model loads.
+    # recorder._ensure_vad() is lazy/thread-safe and swallows failures.
+    def _warmup_bg():
+        transcriber.warmup()
+        recorder._ensure_vad()
+
+    threading.Thread(target=_warmup_bg, daemon=True).start()
 
     scheduler = ReminderScheduler()
     scheduler.start()

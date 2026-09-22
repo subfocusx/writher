@@ -289,17 +289,31 @@ class TestPreprocess:
         assert out.dtype == np.float32
 
     def test_default_flags_match_config_defaults(self):
-        # Defaults of `preprocess(...)` should match the config module's
-        # PP_* flags so that the main pipeline can call
-        # audio_preprocess(audio, sr=..., **{flag_name: getattr(config, f"PP_{name}")})
-        # without diverging from the documented behaviour.
-        sig = _sine(440.0, dur=0.3, amp=0.1)
-        out = ap.preprocess(sig)  # use defaults
-        # Defaults: highpass=True, normalize=True, denoise=False, preemph=False
-        # → should be normalized to -3 dBFS.
+        # Defaults of `preprocess(...)` must mirror the config module's PP_*
+        # flags so the main pipeline can call
+        #   audio_preprocess(audio, sr=..., **{f"do_{name}": getattr(config, f"PP_{name}")})
+        # and a bare preprocess() call behave identically. Kept in sync after
+        # the 2026 USB-mic retune: HIGHPASS off, PREEMPHASIS on.
+        import inspect
+        from audio_preprocess import preprocess
+        sig = inspect.signature(preprocess)
+        assert sig.parameters["do_highpass"].default is False
+        assert sig.parameters["do_preemphasis"].default is True
+        assert sig.parameters["do_normalize"].default is True
+        assert sig.parameters["do_denoise"].default is False
+
+        # Functional check: default path normalizes to -3 dBFS and applies
+        # pre-emphasis (HF boost changes the waveform vs. the raw sine).
+        sig_ = _sine(440.0, dur=0.3, amp=0.1)
+        out = preprocess(sig_)
         peak = float(np.abs(out).max())
         target = 10 ** (-3.0 / 20)
         assert peak == pytest.approx(target, rel=1e-3)
+
+        from audio_preprocess import preemphasis
+        from audio_preprocess import normalize_peak
+        assert not np.array_equal(out, normalize_peak(sig_)), \
+            "pre-emphasis is ON by default — output must differ from normalize-only"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

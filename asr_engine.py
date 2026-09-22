@@ -217,6 +217,31 @@ def _load_onnx_asr():
     return __import__("onnx_asr", fromlist=["load_model"])
 
 
+def _tune_onnxruntime_threads() -> None:
+    """Let onnxruntime use a sensible number of CPU threads for inference.
+
+    Only CPU-affecting knob that does NOT change numerics: sets the intra-op
+    thread count via ``onnxruntime.set_num_threads`` (and the OMP env var
+    before onnxruntime is first imported). It never changes the model graph,
+    quantization or providers — so WER is untouched, only RTF may improve on
+    many-core machines.
+
+    Safe fallbacks: on any import/attribute error we silently skip — loading
+    the session is unchanged otherwise.
+    """
+    n = max(1, (os.cpu_count() or 1))
+    try:
+        # OMP_NUM_THREADS influences onnxruntime's internal OpenMP pool when
+        # the library is imported after setting it.
+        os.environ.setdefault("OMP_NUM_THREADS", str(n))
+        import onnxruntime as ort
+        if hasattr(ort, "set_num_threads"):
+            ort.set_num_threads(n)
+            log.info("onnxruntime intra-op threads set to %d", n)
+    except Exception as exc:
+        log.debug("onnxruntime thread tuning skipped: %s", exc)
+
+
 def default_spec() -> ModelSpec:
     """The built-in default model spec (bundled int8 GigaAM v3 CTC).
 
@@ -281,6 +306,7 @@ class GigaAMEngine:
             raise
         log.info("Loading ASR model: %s", spec.label)
         _register_cuda_dll_paths()
+        _tune_onnxruntime_threads()
         self._asr = load_model(
             spec.model_type,
             path=spec.path,
@@ -348,27 +374,28 @@ class GigaAMEngine:
                                              # utterances — no CTC slicing.
 
     def _transcribe_locked(self, audio: np.ndarray) -> str:
-        """Run ASR on a float32 waveform. Caller must hold ``self._lock``."""
+        """Run ASR on a float32 waveform. Caller must hold ``self._lock``.
+
+        Audio longer than ``_CHUNK_SECONDS`` (30 s) is transcriped through the
+        overlap-slicing path with 30 s slices (1 s overlap + silence tail pad),
+        so words are never dropped/duplicated at a 30 s chunk boundary. This is
+        the same path RNN-T already uses for long audio; the previous simple
+        ``" ".join(texts)`` chunking lost the boundary word exactly where CTC
+        suppresses trailing tokens.
+        """
         self._load_locked()
         duration = len(audio) / self._sample_rate
 
         if duration <= self._CHUNK_SECONDS:
             return self._asr.recognize(audio, sample_rate=self._sample_rate)
 
-        log.info("Long audio (%.1fs), chunking into %ds segments", duration, self._CHUNK_SECONDS)
-        chunk_size = int(self._CHUNK_SECONDS * self._sample_rate)
-        texts = []
-
-        for i in range(0, len(audio), chunk_size):
-            chunk = audio[i:i + chunk_size]
-            text = self._asr.recognize(chunk, sample_rate=self._sample_rate)
-            texts.append(text)
-            log.info("Chunk %d: %.1fs audio -> %d chars: %r", i // chunk_size,
-                     len(chunk) / self._sample_rate, len(text), text[:200])
-
-        result = " ".join(texts)
-        log.info("Chunked transcription: %d chars total", len(result))
-        return result
+        log.info("Long audio (%.1fs), overlap-chunking into %ds slices",
+                 duration, self._CHUNK_SECONDS)
+        return self._transcribe_overlap_locked(
+            audio,
+            slice_seconds=float(self._CHUNK_SECONDS),
+            overlap_seconds=self._SLICE_OVERLAP,
+        )
 
     def _transcribe_overlap_locked(self, audio: np.ndarray,
                                    slice_seconds: float | None = None,

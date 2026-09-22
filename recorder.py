@@ -196,8 +196,9 @@ class Recorder:
                 and self._sample_rate == 16000
                 and config.VAD_AUTO_STOP_SECONDS > 0):
             try:
+                vad_in = self._vad_normalize_for_agc(indata.flatten())
                 speech_prob = self._vad_model(
-                    self._vad_torch.from_numpy(indata.flatten()), 16000
+                    self._vad_torch.from_numpy(vad_in), 16000
                 ).item()
                 if speech_prob < config.VAD_THRESHOLD:
                     self._vad_silence_frames += 1
@@ -210,6 +211,44 @@ class Recorder:
                     self._vad_silence_frames = 0
             except Exception as exc:
                 log.warning("VAD frame error: %s", exc)
+
+    def _vad_normalize_for_agc(self, frame: np.ndarray) -> np.ndarray:
+        """Per-frame level normalisation before Silero VAD (п.7, opt-in).
+
+        Silero scores *raw* frames, so its output shifts with input level:
+        a quiet mic reads even voiced frames as low-probability (phrase
+        start/end clipped), a loud/noisy mic can read noise as speech
+        (auto-stop delayed). Normalising each VAD frame toward a reference
+        RMS makes stop timing more level-independent.
+
+        Returns a NEW array (the recorded frames and on_level meter are
+        never altered — this is only the copy fed to VAD). Near-digital
+        silence is left untouched so auto-stop still fires (the "hang"
+        guard) and gain is clamped to VAD_NORM_MAX_GAIN.
+
+        Disabled when ``config.VAD_NORMALIZE`` is falsy (default) or the
+        frame has no usable level — in which case the input is returned
+        unchanged (still a fresh flatten).
+        """
+        if not getattr(config, "VAD_NORMALIZE", False):
+            return frame
+        if frame.size == 0:
+            return frame
+        ref_rms = float(getattr(config, "VAD_NORM_REF_RMS", 0.05))
+        max_gain = float(getattr(config, "VAD_NORM_MAX_GAIN", 12.0))
+        rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+        # Silence guard: below ~1e-4 RMS the frame is effectively digital
+        # silence / mic-off. Amplifying it would turn noise into "speech"
+        # and the recording would never auto-stop.
+        if rms < 1e-4:
+            return frame
+        gain = ref_rms / rms
+        if gain > max_gain:
+            gain = max_gain
+        if abs(gain - 1.0) < 1e-6:
+            return frame
+        scale = np.float32(gain)
+        return (frame.astype(np.float32) * scale)
 
     def start(self):
         if self.recording:

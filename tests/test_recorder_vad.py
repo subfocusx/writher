@@ -237,3 +237,90 @@ def test_ensure_vad_does_not_raise(recorder_with_vad, monkeypatch):
         inst._ensure_vad()
     except Exception:
         pytest.fail("_ensure_vad raised unexpectedly on missing torch")
+
+
+# ── Adaptive VAD input normalisation (п.7) ────────────────────────────
+
+def test_vad_normalize_disabled_returns_frame(recorder_with_vad):
+    """With VAD_NORMALIZE falsy the frame is returned unchanged."""
+    rec, cfg = recorder_with_vad
+    cfg.VAD_NORMALIZE = False
+    inst = rec.Recorder()
+    frame = np.linspace(-0.3, 0.3, 512, dtype=np.float32)
+    before = frame.copy()
+    out = inst._vad_normalize_for_agc(frame)
+    assert np.allclose(out, before)
+
+
+def test_vad_normalize_quiet_speech_amplified(recorder_with_vad):
+    """With normalisation on, a quiet-but-real frame is scaled toward ref RMS."""
+    rec, cfg = recorder_with_vad
+    cfg.VAD_NORMALIZE = True
+    cfg.VAD_NORM_REF_RMS = 0.05
+    cfg.VAD_NORM_MAX_GAIN = 12.0
+    inst = rec.Recorder()
+    # Real signal, low level (~ -40 dBFS typ): should be amplified
+    rng = np.random.RandomState(7)
+    frame = (rng.randn(512).astype(np.float32) * 0.01)
+    in_rms = float(np.sqrt(np.mean(frame ** 2)))
+    out = inst._vad_normalize_for_agc(frame)
+    out_rms = float(np.sqrt(np.mean(out ** 2)))
+    assert out_rms > in_rms * 2.0
+    assert not np.shares_memory(out, frame)  # returns a new array
+
+
+def test_vad_normalize_digital_silence_untouched(recorder_with_vad):
+    """Near-digital-silence must never be amplified (hang guard)."""
+    rec, cfg = recorder_with_vad
+    cfg.VAD_NORMALIZE = True
+    cfg.VAD_NORM_REF_RMS = 0.05
+    inst = rec.Recorder()
+    frame = np.zeros((512,), dtype=np.float32)
+    frame[::50] = 1e-6  # tiny digital noise floor, well below guard
+    out = inst._vad_normalize_for_agc(frame)
+    assert np.allclose(out, frame)  # unchanged, not blown up
+
+
+def test_vad_normalize_gain_clamped(recorder_with_vad):
+    """Gain must not exceed VAD_NORM_MAX_GAIN even for tiny frames."""
+    rec, cfg = recorder_with_vad
+    cfg.VAD_NORMALIZE = True
+    cfg.VAD_NORM_REF_RMS = 0.05
+    cfg.VAD_NORM_MAX_GAIN = 3.0
+    inst = rec.Recorder()
+    frame = np.ones((512,), dtype=np.float32) * 1e-3  # RMS ~1e-3
+    out = inst._vad_normalize_for_agc(frame)
+    out_rms = float(np.sqrt(np.mean(out ** 2)))
+    # gain capped at 3x => rms ≤ ~3e-3
+    assert out_rms <= 3.1e-3
+
+
+def test_vad_normalize_fed_to_model_when_enabled(recorder_with_vad):
+    """VAD_NORMALIZE=True must normalise the frame handed to the model."""
+    rec, cfg = recorder_with_vad
+    cfg.VAD_NORMALIZE = True
+    cfg.VAD_NORM_REF_RMS = 0.05
+    cfg.VAD_NORM_MAX_GAIN = 12.0
+
+    captured = {}
+
+    class _CapturingVAD:
+        def __call__(self, tensor, sr):
+            captured["rms"] = float(np.sqrt(np.mean(tensor.data ** 2)))
+            return _FakeTensor(tensor.data, 0.1)
+
+    inst = rec.Recorder()
+    inst.recording = True
+    inst._sample_rate = 16000
+    inst._vad_model = _CapturingVAD()
+    inst._vad_torch = _FakeTorch
+    inst.on_vad_trigger = lambda: None
+
+    rng = np.random.RandomState(3)
+    char_frame = np.zeros((512, 1), dtype=np.float32)
+    char_frame[:] = rng.randn(512, 1).astype(np.float32) * 0.01
+    inst._callback(char_frame, 512, None, None)
+
+    raw_rms = float(np.sqrt(np.mean(char_frame ** 2)))
+    assert captured["rms"] > raw_rms * 2.0
+

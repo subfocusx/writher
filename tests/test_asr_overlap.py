@@ -244,3 +244,73 @@ class TestOverlapSlicePadding:
             # The tail of each slice is zero (the silence pad).
             tail_len = tail_pad_samples
             np.testing.assert_array_equal(sent[-tail_len:], np.zeros(tail_len))
+
+
+class TestLongAudioOverlapPath:
+    """Regression for the >30s chunking bug fix: ``_transcribe_locked`` must
+    route long audio through the overlap-slicing path (30s slices with
+    1s overlap + tail pad) instead of the old plain ``" ".join(texts)``
+    chunking that dropped/duplicated the boundary word."""
+
+    @staticmethod
+    def _make_engine_with_fake_asr(captured: list):
+        from asr_engine import GigaAMEngine
+
+        class FakeEngine(GigaAMEngine):
+            def __init__(self):
+                self._asr = type("F", (), {})()
+                self._lock = __import__("threading").RLock()
+                self._sample_rate = 16000
+                self._loaded_spec = object()  # non-None so _load_locked is skipped
+                self._spec = object()
+
+            def _load_locked(self):  # no-op, model is "loaded"
+                return
+
+        eng = FakeEngine()
+
+        def fake_recognize(audio, sample_rate):
+            captured.append(np.asarray(audio).copy())
+            return "fake"
+
+        eng._asr.recognize = fake_recognize
+        return eng
+
+    def test_long_audio_uses_overlap_path_not_plain_join(self):
+        """Audio > _CHUNK_SECONDS must go through overLapping 30s slices
+        (multiple recognize calls with tail pads), not a single .join call."""
+        from asr_engine import GigaAMEngine
+
+        captured = []
+        eng = self._make_engine_with_fake_asr(captured)
+
+        # 65 s of audio @ 16 kHz = 1 040 000 samples. > 30 s chunk boundary.
+        audio = np.ones(65 * 16000, dtype=np.float32)
+        eng._transcribe_locked(audio)
+
+        # The overlap path produces ≥2 padded slices (30s slice, 1s overlap).
+        assert len(captured) >= 2, f"expected ≥2 slices for 65s, got {len(captured)}"
+        slice_len_samples = int(GigaAMEngine._CHUNK_SECONDS * 16000)
+        tail_pad_samples = int(GigaAMEngine._TAIL_PAD_SECONDS * 16000)
+        for sent in captured:
+            # Each slice body ≤ (30s slice + tail pad), and ends with silence.
+            assert len(sent) <= slice_len_samples + tail_pad_samples, (
+                f"slice too long: {len(sent)}"
+            )
+            np.testing.assert_array_equal(sent[-tail_pad_samples:], np.zeros(tail_pad_samples))
+        # On an empty model the overlap path delegates to _stitch_overlap_texts,
+        # which for identical "fake" pieces returns a single space-joined string
+        # (no duplicate). We just verify the call path executed.
+
+    def test_short_audio_in_long_transcribe_uses_single_pass(self):
+        """Audio ≤ _CHUNK_SECONDS through _transcribe_locked stays a single
+        recognize() call (unchanged behaviour)."""
+        from asr_engine import GigaAMEngine
+
+        captured = []
+        eng = self._make_engine_with_fake_asr(captured)
+
+        audio = np.ones(15 * 16000, dtype=np.float32)
+        result = eng._transcribe_locked(audio)
+        assert len(captured) == 1, "expected a single recognize call for 15s"
+        assert result == "fake"

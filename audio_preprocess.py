@@ -3,9 +3,15 @@
 Pipeline order (matters):
     raw audio (16 kHz mono float32)
         → spectral denoise           (noisereduce, optional, OFF by default)
-        → high-pass @ 80 Hz          (scipy Butterworth, optional)
-        → pre-emphasis 0.97          (numpy, optional, OFF by default)
+        → high-pass @ 80 Hz          (scipy Butterworth, optional, OFF)
+        → pre-emphasis 0.97          (numpy, optional, ON by default)
         → peak normalize to -3 dBFS  (numpy, always if peaks > 0)
+
+Defaults of ``preprocess()`` follow ``config.PP_*`` (the app pipeline passes
+all flags explicitly). The main pipeline contract: calling
+``audio_preprocess(audio, sr=..., **{flag: getattr(config, f"PP_{name}")})``
+must match calling it with no flag args at all — see
+``tests/test_audio_preprocess.py::test_default_flags_match_config_defaults``.
 
 All steps degrade gracefully: if a dependency is missing, the corresponding
 stage is skipped. The module is safe to import on any venv that has numpy.
@@ -53,9 +59,9 @@ def highpass(audio: np.ndarray, cutoff_hz: float = 80.0, sr: int = DEFAULT_SR) -
 def preemphasis(audio: np.ndarray, coef: float = 0.97) -> np.ndarray:
     """y[n] = x[n] - coef * x[n-1]. Boosts high frequencies.
 
-    Standard pre-processing for acoustic models. GigaAM was NOT explicitly
-    trained with pre-emphasis — leaving OFF by default. Enable only if you
-    observe muffled recognition of fricatives.
+    Standard pre-processing for acoustic models. Enabled by default for
+    GigaAM v3 (``config.PP_PREEMPHASIS = True``) — without it, s/sh/shch/f
+    at word boundaries can come out clipped on USB-headset recordings.
     """
     if audio.size == 0:
         return audio
@@ -102,8 +108,8 @@ def preprocess(
     sr: int = DEFAULT_SR,
     *,
     do_denoise: bool = False,
-    do_highpass: bool = True,
-    do_preemphasis: bool = False,
+    do_highpass: bool = False,
+    do_preemphasis: bool = True,
     do_normalize: bool = True,
 ) -> np.ndarray:
     """Apply selected pre-processing stages.
@@ -115,6 +121,10 @@ def preprocess(
         do_highpass: 80 Hz high-pass (scipy optional, falls back to skip).
         do_preemphasis: HF boost (numpy only).
         do_normalize: peak normalize to -3 dBFS (numpy only).
+
+    Defaults match ``config.PP_*`` so calling ``preprocess()`` without flag
+    args behaves like the main pipeline (which passes config flags explicitly):
+    HIGHPASS off, PREEMPHASIS on, NORMALIZE on, DENOISE off.
 
     Returns:
         Pre-processed mono float32 audio, same length.
